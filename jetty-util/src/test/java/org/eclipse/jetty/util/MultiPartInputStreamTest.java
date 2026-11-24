@@ -93,6 +93,125 @@ public class MultiPartInputStreamTest
         }
     }
 
+    private static String createMultipartFormString(String boundary, int numParts)
+    {
+        StringBuilder str = new StringBuilder();
+        for (int i = 1; i <= numParts; i++)
+        {
+            str.append("--").append(boundary).append("\r\n");
+            str.append("Content-Disposition: form-data; name=\"part").append(i).append("\"\r\n\r\n");
+            str.append("value").append(i).append("\r\n");
+        }
+        str.append("--").append(boundary).append("--\r\n");
+        return str.toString();
+    }
+
+    @Test
+    public void testTooManyParts()
+    throws Exception
+    {
+        String boundary = "X0Y0";
+        String str = createMultipartFormString(boundary, 3);
+
+        MultipartConfigElement config = new MultipartConfigElement(_dirname, 1024, 3072, 50);
+        // CVE-2023-26048: cap the number of parts. Parsing a form with more parts than
+        // allowed must fail fast rather than buffering unbounded parts (DoS).
+        MultiPartInputStreamParser mpis = new MultiPartInputStreamParser(new ByteArrayInputStream(str.getBytes()),
+                                                                         "multipart/form-data, boundary="+boundary,
+                                                                         config,
+                                                                         _tmpDir,
+                                                                         2);
+        mpis.setDeleteOnExit(true);
+        try
+        {
+            mpis.getParts();
+            fail ("Form with too many parts should be rejected");
+        }
+        catch (IllegalStateException e)
+        {
+            assertThat(e.getMessage(), Matchers.containsString("Form with too many parts"));
+        }
+    }
+
+    @Test
+    public void testPartsAtLimit()
+    throws Exception
+    {
+        String boundary = "X0Y0";
+        String str = createMultipartFormString(boundary, 3);
+
+        MultipartConfigElement config = new MultipartConfigElement(_dirname, 1024, 3072, 50);
+        MultiPartInputStreamParser mpis = new MultiPartInputStreamParser(new ByteArrayInputStream(str.getBytes()),
+                                                                         "multipart/form-data, boundary="+boundary,
+                                                                         config,
+                                                                         _tmpDir,
+                                                                         3);
+        mpis.setDeleteOnExit(true);
+        Collection<Part> parts = mpis.getParts();
+        assertThat(parts.size(), is(3));
+        assertNotNull(mpis.getPart("part3"));
+    }
+
+    @Test
+    public void testDefaultMaxPartsRejectsTooManyParts()
+    throws Exception
+    {
+        String boundary = "X0Y0";
+        String str = createMultipartFormString(boundary, 1001);
+
+        MultipartConfigElement config = new MultipartConfigElement(_dirname, 1024, -1, 50);
+        // The original 4-arg constructor must apply the default limit of 1000 parts.
+        MultiPartInputStreamParser mpis = new MultiPartInputStreamParser(new ByteArrayInputStream(str.getBytes()),
+                                                                         "multipart/form-data, boundary="+boundary,
+                                                                         config,
+                                                                         _tmpDir);
+        mpis.setDeleteOnExit(true);
+        try
+        {
+            mpis.getParts();
+            fail ("Form with more than the default maximum number of parts should be rejected");
+        }
+        catch (IllegalStateException e)
+        {
+            assertThat(e.getMessage(), Matchers.containsString("Form with too many parts"));
+        }
+    }
+
+    @Test
+    public void testDefaultMaxPartsAllowsLimit()
+    throws Exception
+    {
+        String boundary = "X0Y0";
+        String str = createMultipartFormString(boundary, 1000);
+
+        MultipartConfigElement config = new MultipartConfigElement(_dirname, 1024, -1, 50);
+        MultiPartInputStreamParser mpis = new MultiPartInputStreamParser(new ByteArrayInputStream(str.getBytes()),
+                                                                         "multipart/form-data, boundary="+boundary,
+                                                                         config,
+                                                                         _tmpDir);
+        mpis.setDeleteOnExit(true);
+        Collection<Part> parts = mpis.getParts();
+        assertThat(parts.size(), is(1000));
+    }
+
+    @Test
+    public void testUnlimitedParts()
+    throws Exception
+    {
+        String boundary = "X0Y0";
+        String str = createMultipartFormString(boundary, 1001);
+
+        MultipartConfigElement config = new MultipartConfigElement(_dirname, 1024, -1, 50);
+        MultiPartInputStreamParser mpis = new MultiPartInputStreamParser(new ByteArrayInputStream(str.getBytes()),
+                                                                         "multipart/form-data, boundary="+boundary,
+                                                                         config,
+                                                                         _tmpDir,
+                                                                         -1);
+        mpis.setDeleteOnExit(true);
+        Collection<Part> parts = mpis.getParts();
+        assertThat(parts.size(), is(1001));
+    }
+
 
     @Test
     public void testFinalBoundaryOnly()
