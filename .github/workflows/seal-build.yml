@@ -1,0 +1,277 @@
+# Authored for sealed-libraries: Jetty 9.3.x has no GitHub Actions CI upstream
+# (only a Jenkinsfile: jdk8 + maven3 `mvn -B clean install`). This workflow
+# mirrors that build and runs the project's own surefire suites, scoped so the
+# job fits the CI budget:
+#   - util leg: builds the reactor up to jetty-util/jetty-servlet without tests,
+#     then runs the FULL surefire suites of jetty-util (the shipped artifact) and
+#     jetty-servlet (DefaultServlet directory listing = Resource/ResourceCollators
+#     patched paths); produces and uploads the release jars.
+#   - coverage leg: runs the named test classes that cover the remaining
+#     CVE-patched paths in http/server/client/servlets/http2/test-http-client-transport.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector (comma/space separated); empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: build (${{ matrix.leg }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: util
+            modules: jetty-util,jetty-servlet
+            tests: ""
+          - leg: coverage
+            modules: jetty-http,jetty-server,jetty-client,jetty-servlets,jetty-http2/http2-client,tests/test-http-client-transport
+            tests: "HttpURITest,HttpParserTest,RequestTest,ResponseTest,ResourceHandlerTest,ThreadLimitHandlerTest,HttpClientURITest,DoSFilterTest,ConcatServletTest,PushCacheFilterTest,HttpClientLoadTest"
+    env:
+      LC_ALL: C.UTF-8
+      LANG: C.UTF-8
+      MAVEN_OPTS: "-Xmx3g -Djava.awt.headless=true"
+      TEST_FILTER: ${{ inputs.test-filter }}
+      # Non-test gates (lint/static analysis/licence/javadoc/signing) are disabled; tests still run.
+      # surefire.timeout = forkedProcessTimeoutInSeconds: a hung test fork is killed instead of stalling the job.
+      MVN_SKIPS: "-Dmaven.javadoc.skip=true -Dcheckstyle.skip=true -Denforcer.skip=true -Dgpg.skip=true -Dlicense.skip=true -Dfindbugs.skip=true -Dpmd.skip=true -Dclirr.skip=true -Dsurefire.timeout=900"
+    steps:
+      - uses: actions/checkout@v4
+
+      # The build runs on Zulu 8u172 so the root pom's java.version-activated 8u172
+      # profile sets alpn.version (needed by tests/test-http-client-transport).
+      # The runner's preinstalled JDK only supplies a current cacerts.
+      - name: Install Zulu JDK 8u172 and Maven 3.9.5
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o zulu.tgz https://cdn.azul.com/zulu/bin/zulu8.30.0.1-ca-jdk8.0.172-linux_x64.tar.gz
+          mkdir -p zulu && tar xzf zulu.tgz -C zulu
+          ZULU="$(ls -d "$RUNNER_TEMP"/zulu/*/)"; ZULU="${ZULU%/}"
+          for c in "${JAVA_HOME_8_X64:-/nonexistent}/jre/lib/security/cacerts" "${JAVA_HOME_8_X64:-/nonexistent}/lib/security/cacerts" /etc/ssl/certs/java/cacerts "${JAVA_HOME_11_X64:-/nonexistent}/lib/security/cacerts"; do
+            if [ -f "$c" ]; then echo "cacerts from $c"; cp "$c" "$ZULU/jre/lib/security/cacerts"; break; fi
+          done
+          curl -fsSL -o maven.tgz https://archive.apache.org/dist/maven/maven-3/3.9.5/binaries/apache-maven-3.9.5-bin.tar.gz
+          tar xzf maven.tgz
+          MVN_HOME="$RUNNER_TEMP/apache-maven-3.9.5"
+          # Replace the default settings (whose http blocker breaks the jenkins-ci chain of
+          # jetty-version-maven-plugin) with Central + https repo.jenkins-ci.org.
+          cat > "$MVN_HOME/conf/settings.xml" <<'EOF'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>central-https</id>
+                <mirrorOf>*,!jenkins-ci</mirrorOf>
+                <url>https://repo.maven.apache.org/maven2</url>
+              </mirror>
+            </mirrors>
+            <profiles>
+              <profile>
+                <id>jenkins-ci</id>
+                <repositories>
+                  <repository><id>jenkins-ci</id><url>https://repo.jenkins-ci.org/public/</url></repository>
+                </repositories>
+                <pluginRepositories>
+                  <pluginRepository><id>jenkins-ci</id><url>https://repo.jenkins-ci.org/public/</url></pluginRepository>
+                </pluginRepositories>
+              </profile>
+            </profiles>
+            <activeProfiles><activeProfile>jenkins-ci</activeProfile></activeProfiles>
+          </settings>
+          EOF
+          echo "JAVA_HOME=$ZULU" >> "$GITHUB_ENV"
+          echo "$ZULU/bin" >> "$GITHUB_PATH"
+          echo "$MVN_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Toolchain
+        run: |
+          java -version
+          mvn -version
+
+      - name: Build upstream reactor modules (tests run below)
+        run: |
+          set -euo pipefail
+          mvn -B -e install -pl "${{ matrix.modules }}" -am -DskipTests $MVN_SKIPS 2>&1 | tail -n 80
+
+      - name: Test
+        run: |
+          set -euo pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            SEL="${TEST_FILTER// /,}"
+          else
+            SEL="${{ matrix.tests }}"
+          fi
+          if [ -n "$SEL" ]; then
+            mvn -B -e install -fae -pl "${{ matrix.modules }}" $MVN_SKIPS \
+              -Dtest="$SEL" -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false 2>&1 | tee "$RUNNER_TEMP/mvn.log"
+          else
+            # full surefire suites of the leg's own modules
+            mvn -B -e install -fae -pl "${{ matrix.modules }}" $MVN_SKIPS 2>&1 | tee "$RUNNER_TEMP/mvn.log"
+          fi
+
+      - name: Test summary (per class, skipped tests with reasons, total)
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import glob, os, re, xml.etree.ElementTree as ET
+
+          src_index = {}
+          for p in glob.glob('**/src/test/java/**/*.java', recursive=True):
+              rel = p.split('/src/test/java/', 1)[1][:-5].replace('/', '.')
+              src_index.setdefault(rel, p)
+
+          def read(cls):
+              p = src_index.get(cls)
+              return open(p, encoding='utf-8', errors='replace').read() if p else None
+
+          def superclass(cls, text):
+              m = re.search(r'class\s+\w+(?:<[^{]*?>)?\s+extends\s+([\w.]+)', text)
+              if not m:
+                  return None
+              name = m.group(1)
+              if '.' in name:
+                  return name
+              imp = re.search(r'import\s+([\w.]+\.' + re.escape(name) + r')\s*;', text)
+              if imp:
+                  return imp.group(1)
+              return cls.rsplit('.', 1)[0] + '.' + name
+
+          def method_reason(text, method):
+              m = re.search(r'((?:\s*(?://[^\n]*|@[\w.]+(?:\([^)]*\))?)\s*)*)\s*public\s+void\s+' + re.escape(method) + r'\s*\(', text)
+              if not m:
+                  return None
+              start = m.end()
+              depth, i = 0, text.find('{', start)
+              body_start = i
+              while i < len(text):
+                  if text[i] == '{': depth += 1
+                  elif text[i] == '}':
+                      depth -= 1
+                      if depth == 0: break
+                  i += 1
+              body = text[body_start:i]
+              parts = []
+              ann = m.group(1) or ''
+              ig = re.search(r'@Ignore(\([^)]*\))?', ann)
+              if ig:
+                  parts.append('@Ignore' + (ig.group(1) or ''))
+              parts += [l.strip() for l in ann.splitlines() if l.strip().startswith('//')]
+              parts += [l.strip() for l in body.splitlines() if 'Assume' in l or 'assume' in l]
+              return '; '.join(parts) if parts else 'method found, no inline Ignore/Assume (see class-level guard)'
+
+          def class_reason(text):
+              parts = []
+              ig = re.search(r'@Ignore(\([^)]*\))?\s*(?:@\w+[^\n]*\s*)*public\s+(?:abstract\s+)?class', text)
+              if ig:
+                  parts.append('class @Ignore' + (ig.group(1) or ''))
+              for l in text.splitlines():
+                  s = l.strip()
+                  if ('Assume' in s or 'assume' in s) and not s.startswith('import'):
+                      parts.append(s)
+                  elif '? null' in s:
+                      parts.append(s)
+              return '; '.join(dict.fromkeys(parts))
+
+          def reason_for(cls, method):
+              method = re.sub(r'\[.*$', '', method)
+              seen, c, cls_reasons = 0, cls, []
+              while c and seen < 6:
+                  text = read(c)
+                  if text is None:
+                      break
+                  r = method_reason(text, method)
+                  if r:
+                      cr = class_reason(text)
+                      return r + ((' | class guards: ' + cr) if cr and 'no inline' in r else '') + ' (in ' + c + ')'
+                  cr = class_reason(text)
+                  if cr:
+                      cls_reasons.append(c + ': ' + cr)
+                  c = superclass(c, text); seen += 1
+              return ' | '.join(cls_reasons) if cls_reasons else 'skipped by surefire (no source reason found)'
+
+          # Count each (class, test name) once, exactly as the surefire console summary does:
+          # parameterized rows whose data has an identical toString() (e.g. ResourceTest) are
+          # written to the XML several times under one name but counted once by surefire.
+          from collections import OrderedDict
+          keys = ('run', 'fail', 'err', 'skip')
+          modules = OrderedDict()
+          groups = OrderedDict()
+          dup_entries = 0
+          for f in sorted(glob.glob('**/target/surefire-reports/TEST-*.xml', recursive=True)):
+              mod = f.split('/target/surefire-reports/')[0]
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception as e:
+                  print('unparseable', f, e); continue
+              suites = [root] if root.tag == 'testsuite' else root.findall('testsuite')
+              seen = {}
+              for s in suites:
+                  for tc in s.findall('testcase'):
+                      cls = tc.get('classname') or s.get('name')
+                      k = (cls, tc.get('name'))
+                      if k in seen:
+                          dup_entries += 1; continue
+                      if tc.find('failure') is not None: st = 'fail'
+                      elif tc.find('error') is not None: st = 'err'
+                      elif tc.find('skipped') is not None: st = 'skip'
+                      else: st = 'pass'
+                      seen[k] = (st, tc.find('skipped'))
+              m = modules.setdefault(mod, dict.fromkeys(keys + ('pass',), 0))
+              per = dict.fromkeys(keys, 0)
+              for (cls, name), (st, sk) in seen.items():
+                  m['run'] += 1; per['run'] += 1
+                  m[st] += 1
+                  if st != 'pass': per[st] += 1
+                  if st == 'skip':
+                      msg = (sk.get('message') or '').strip()
+                      why = msg or reason_for(cls, name)
+                      base = re.sub(r'\[.*$', '', name)
+                      g = groups.setdefault((cls, base, why[:220]), 0)
+                      groups[(cls, base, why[:220])] = g + 1
+              if per['fail'] or per['err'] or per['skip']:
+                  cname = os.path.basename(f)[5:-4]
+                  print('%-75s run=%d fail=%d err=%d skip=%d' % (cname, per['run'], per['fail'], per['err'], per['skip']))
+          print()
+          print('=== SKIPPED TESTS (grouped by test method; xN = parameterized rows) ===')
+          for (cls, base, why), n in groups.items():
+              print('SKIPPED %s#%s x%d -- reason: %s' % (cls, base, n, why))
+          print()
+          # TOTAL = sum of surefire's own per-module "Results :" lines from the Maven log
+          # (authoritative); falls back to the XML reports if the log is unavailable.
+          tot = dict.fromkeys(keys, 0)
+          mods = 0
+          log = os.path.join(os.environ.get('RUNNER_TEMP', '.'), 'mvn.log')
+          if os.path.exists(log):
+              pat = re.compile(r'^(?:\[\w+\]\s*)?Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)\s*$')
+              for line in open(log, encoding='utf-8', errors='replace'):
+                  mm = pat.match(line.strip())
+                  if mm:
+                      mods += 1
+                      for k, v in zip(keys, mm.groups()): tot[k] += int(v)
+          if mods:
+              src = 'surefire Results lines of %d module(s)' % mods
+          else:
+              for m in modules.values():
+                  for k in keys: tot[k] += m[k]
+              src = 'surefire XML reports'
+          passed = tot['run'] - tot['fail'] - tot['err'] - tot['skip']
+          print('TOTAL tests run: %d, passed: %d, failures: %d, errors: %d, skipped: %d (from %s)' % (tot['run'], passed, tot['fail'], tot['err'], tot['skip'], src))
+          PYEOF
+
+      - name: Upload release jars
+        if: matrix.leg == 'util'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetty-util-jars
+          path: |
+            jetty-util/target/jetty-util-*.jar
+            !jetty-util/target/*-sources.jar
+            !jetty-util/target/*-javadoc.jar
+            !jetty-util/target/*-tests.jar
+          if-no-files-found: error
